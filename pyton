@@ -1,0 +1,171 @@
+import json
+import time
+import logging
+import threading
+import os
+from confluent_kafka import Producer, Consumer, KafkaError
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+# ========================
+# ШАГ 3: Класс сообщения + сериализация
+# ========================
+class KafkaMessage:
+    def __init__(self, msg_id, content):
+        self.id = msg_id
+        self.text = content
+        self.timestamp = time.time()
+
+    def serialize(self):
+        try:
+            return json.dumps(self.__dict__).encode('utf-8')
+        except Exception as e:
+            print(f"[ОШИБКА] Не удалось сериализовать сообщение: {e}")
+            return None
+
+    @staticmethod
+    def deserialize(data):
+        try:
+            if not data:
+                return None
+            return json.loads(data.decode('utf-8'))
+        except Exception as e:
+            print(f"[ОШИБКА] Не удалось десериализовать сообщение: {e}")
+            return None
+
+# ========================
+# Продюсер (push-модель, At Least Once)
+# ========================
+class ProducerWorker:
+    def __init__(self, bootstrap_servers):
+        self.producer = Producer({
+            'bootstrap.servers': bootstrap_servers,
+            'acks': 'all',      # Ждём подтверждения от всех реплик. Нужен для гарантии At Least Once
+            'retries': 3,       # 3 попытки повторной отправки при временных проблемах с сетью/брокером
+            'client.id': 'lab-producer'
+        })
+
+    def _on_delivery(self, err, msg):
+        if err:
+            logging.error(f"[PROD] Ошибка доставки: {err}")
+        else:
+            logging.info(f"[PROD] Доставлено в {msg.topic()}[{msg.partition()}] offset={msg.offset()}")
+
+    def run(self):
+        try:
+            i = 1
+            while True:
+                msg_obj = KafkaMessage(msg_id=i, content=f"Сообщение #{i}")
+                raw = msg_obj.serialize()
+                if raw:
+                    print(f"[PROD] Отправляю: {json.loads(raw)}")
+                    self.producer.produce('my-topic', value=raw, callback=self._on_delivery)
+                    self.producer.poll(0)  # Обрабатываем колбэки без блокировки
+                i += 1
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n[PROD] Остановка...")
+        finally:
+            self.producer.flush()
+
+# ========================
+# Консьюмер 1: По одному сообщению, автокоммит
+# ========================
+class SingleMessageConsumer:
+    def __init__(self, bootstrap_servers):
+        self.consumer = Consumer({
+            'bootstrap.servers': bootstrap_servers,
+            'group.id': 'group-single',       # Уникальная группа -> читает все сообщения независимо
+            'enable.auto.commit': True,       # Kafka сама сохраняет смещения в фоне
+            'auto.commit.interval.ms': 1000,  # Интервал сохранения
+            'client.id': 'lab-single'
+        })
+
+    def run(self):
+        self.consumer.subscribe(['my-topic'])
+        logging.info("[SINGLE] Запущен. Читаю по одному...")
+        try:
+            while True:
+                msg = self.consumer.poll(1.0)
+                if not msg:
+                    continue
+                if msg.error():
+                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                        continue
+                    logging.error(f"[SINGLE] Ошибка чтения: {msg.error()}")
+                    continue
+
+                data = KafkaMessage.deserialize(msg.value())
+                if data:
+                    logging.info(f"[SINGLE] Принято: {data['text']}")
+        except Exception as e:
+            logging.error(f"[SINGLE] Критическая ошибка: {e}")
+        finally:
+            self.consumer.close()
+
+# ========================
+# Консьюмер 2: Пачками, ручной коммит
+# ========================
+class BatchMessageConsumer:
+    def __init__(self, bootstrap_servers):
+        self.consumer = Consumer({
+            'bootstrap.servers': bootstrap_servers,
+            'group.id': 'group-batch',        # Другая группа -> дублирует чтение
+            'enable.auto.commit': False,      # Отключаем автокоммит
+            'fetch.min.bytes': 1024,          # Брокер не ответит, пока не наберётся минимум 1КБ
+            'fetch.max.wait.ms': 500,         # Но ждать будет не больше 500 мс
+            'client.id': 'lab-batch'
+        })
+
+    def run(self):
+        self.consumer.subscribe(['my-topic'])
+        logging.info("[BATCH] Запущен. Читаю пачками...")
+        try:
+            while True:
+                batch = []
+                # poll() возвращает по 1 сообщению, поэтому собираем пачку в цикле
+                for _ in range(10):
+                    m = self.consumer.poll(0.1)
+                    if m and not m.error():
+                        batch.append(m)
+                    elif m and m.error():
+                        if m.error().code() == KafkaError._PARTITION_EOF:
+                            continue
+                        logging.error(f"[BATCH] Ошибка чтения: {m.error()}")
+
+                if not batch:
+                    continue
+
+                for m in batch:
+                    data = KafkaMessage.deserialize(m.value())
+                    if data:
+                        logging.info(f"[BATCH] Обработано: {data['text']}")
+
+                # Коммитим один раз после обработки всей пачки
+                self.consumer.commit(asynchronous=False)
+                logging.info(f"[BATCH] Закоммичено смещений для {len(batch)} сообщений")
+        except Exception as e:
+            logging.error(f"[BATCH] Критическая ошибка: {e}")
+        finally:
+            self.consumer.close()
+
+# ========================
+# Запуск
+# ========================
+if __name__ == "__main__":
+    bs = os.getenv("BOOTSTRAP_SERVERS", "localhost:9092,localhost:9093")
+    print(f"Подключаемся к брокерам: {bs}")
+
+    prod = ProducerWorker(bs)
+    c1 = SingleMessageConsumer(bs)
+    c2 = BatchMessageConsumer(bs)
+
+    threading.Thread(target=prod.run, daemon=True).start()
+    threading.Thread(target=c1.run, daemon=True).start()
+    threading.Thread(target=c2.run, daemon=True).start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nЗавершение работы...")
